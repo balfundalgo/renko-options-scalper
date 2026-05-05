@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 # ─────────────────────────────────────────────────────────────────
-# PyInstaller spec — Balfund Renko Options Scalper
+# PyInstaller spec — Balfund Renko Scalper v2.0
 # Produces a single-file Windows EXE with CustomTkinter bundled.
 # ─────────────────────────────────────────────────────────────────
 
