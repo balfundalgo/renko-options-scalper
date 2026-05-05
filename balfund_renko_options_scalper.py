@@ -25,11 +25,12 @@
 #   pip install customtkinter requests pandas websocket-client python-dotenv
 # ─────────────────────────────────────────────────────────────────────
 
-import os, sys, time, json, math, struct, threading, logging
+import os, sys, time, json, math, struct, threading, logging, platform
 from datetime import datetime, timezone, timedelta, date
 from typing import Dict, Optional, List, Any, Tuple
 from collections import deque
 from io import StringIO
+from pathlib import Path
 
 import requests
 import pandas as pd
@@ -42,8 +43,23 @@ except ImportError:
     print("ERROR: customtkinter not installed. Run: pip install customtkinter")
     sys.exit(1)
 
-VERSION = "2.0"
+VERSION = "2.1"
 APP_TITLE = f"Balfund Renko Scalper v{VERSION}"
+
+# ── Shared Token (Dhan Token Generator EXE) ────────────────────
+TOKEN_SERVER_URL = "http://localhost:5555/token"
+if platform.system() == "Windows":
+    SHARED_TOKEN_FILE = Path("C:/balfund_shared/dhan_token.json")
+else:
+    SHARED_TOKEN_FILE = Path.home() / "balfund_shared" / "dhan_token.json"
+
+# ── Instrument master cache (avoid 50MB download every run) ────
+if getattr(sys, 'frozen', False):
+    _APP_DIR = Path(sys.executable).parent
+else:
+    _APP_DIR = Path(__file__).resolve().parent
+MASTER_CSV_CACHE = _APP_DIR / "dhan_scrip_master_cache.csv"
+MASTER_CACHE_MAX_AGE_H = 12  # re-download if older than 12 hours
 
 WS_URL_TEMPLATE = (
     "wss://api-feed.dhan.co?version=2"
@@ -58,6 +74,42 @@ RESP_TICKER = 2
 NIFTY_SPOT_SEC_ID = "13"
 NIFTY_SPOT_EXCHANGE = "IDX_I"
 IST_OFFSET = timedelta(hours=5, minutes=30)
+
+# ── Token Loader ───────────────────────────────────────────────
+
+def load_token_from_shared() -> Optional[Dict]:
+    """
+    Load Dhan credentials from shared token file or localhost HTTP.
+    Priority: 1) C:\\balfund_shared\\dhan_token.json  2) localhost:5555
+    Returns dict with 'client_id' and 'access_token', or None.
+    """
+    # Method 1: Shared file
+    if SHARED_TOKEN_FILE.exists():
+        try:
+            data = json.loads(SHARED_TOKEN_FILE.read_text(encoding="utf-8"))
+            cid = data.get("client_id", "").strip()
+            tok = data.get("access_token", "").strip()
+            if cid and tok:
+                gen = data.get("generated_at", "?")
+                log.info(f"Token loaded from file | Client={cid} | Generated={gen}")
+                return {"client_id": cid, "access_token": tok}
+        except Exception as e:
+            log.warning(f"Shared token file read error: {e}")
+
+    # Method 2: HTTP localhost
+    try:
+        resp = requests.get(TOKEN_SERVER_URL, timeout=3)
+        if resp.status_code == 200:
+            data = resp.json()
+            cid = data.get("client_id", "").strip()
+            tok = data.get("access_token", "").strip()
+            if cid and tok:
+                log.info(f"Token loaded from HTTP | Client={cid}")
+                return {"client_id": cid, "access_token": tok}
+    except Exception:
+        pass
+
+    return None
 
 INSTRUMENT_DEFS = {
     "NIFTY_CE": {
@@ -174,13 +226,43 @@ class RenkoEngine:
 class InstrumentResolver:
     def __init__(self):
         self.nifty_df = None; self.mcx_df = None; self.loaded = False
-    def load(self):
+    def load(self, status_cb=None):
+        def _status(msg):
+            log.info(msg)
+            if status_cb:
+                try: status_cb(msg)
+                except: pass
         try:
-            log.info("Downloading Dhan instrument master...")
-            r = requests.get(INSTRUMENT_CSV_URL, timeout=30); r.raise_for_status()
+            # Check cache first
+            use_cache = (
+                MASTER_CSV_CACHE.exists()
+                and (time.time() - MASTER_CSV_CACHE.stat().st_mtime) < MASTER_CACHE_MAX_AGE_H * 3600
+            )
+            if use_cache:
+                age_h = (time.time() - MASTER_CSV_CACHE.stat().st_mtime) / 3600
+                _status(f"Using cached instrument master ({age_h:.1f}h old)")
+                text = MASTER_CSV_CACHE.read_text(encoding="utf-8", errors="replace")
+            else:
+                _status("Downloading Dhan instrument master (~50MB)...")
+                r = requests.get(INSTRUMENT_CSV_URL, timeout=120, stream=True)
+                r.raise_for_status()
+                total = int(r.headers.get("content-length", 0))
+                content = b""; downloaded = 0
+                for chunk in r.iter_content(chunk_size=131072):
+                    content += chunk; downloaded += len(chunk)
+                    if total:
+                        pct = downloaded / total * 100
+                        _status(f"Downloading... {downloaded//1048576}MB / {total//1048576}MB ({pct:.0f}%)")
+                text = content.decode("utf-8", errors="replace")
+                try:
+                    MASTER_CSV_CACHE.write_text(text, encoding="utf-8")
+                    _status("Instrument master cached locally")
+                except Exception as e:
+                    log.warning(f"Could not cache master: {e}")
+
             usecols = ["EXCH_ID","SEGMENT","SECURITY_ID","INSTRUMENT","SYMBOL_NAME",
                        "DISPLAY_NAME","SM_EXPIRY_DATE","SM_STRIKE_PRICE","SM_OPTION_TYPE"]
-            df = pd.read_csv(StringIO(r.text), usecols=usecols, low_memory=False)
+            df = pd.read_csv(StringIO(text), usecols=usecols, low_memory=False)
             for c in ["EXCH_ID","SEGMENT","INSTRUMENT","SYMBOL_NAME","DISPLAY_NAME","SM_OPTION_TYPE"]:
                 df[c] = df[c].astype(str).str.strip()
             df["SM_EXPIRY_DATE"] = pd.to_datetime(df["SM_EXPIRY_DATE"], errors="coerce")
@@ -189,10 +271,10 @@ class InstrumentResolver:
             self.nifty_df = df[(df["EXCH_ID"]=="NSE")&(df["INSTRUMENT"]=="OPTIDX")&(df["SYMBOL_NAME"]=="NIFTY")].copy()
             self.mcx_df = df[(df["EXCH_ID"]=="MCX")&(df["INSTRUMENT"]=="FUTCOM")].copy()
             self.loaded = True
-            log.info(f"Master loaded | NIFTY opts: {len(self.nifty_df)} | MCX futs: {len(self.mcx_df)}")
+            _status(f"Master loaded | NIFTY opts: {len(self.nifty_df)} | MCX futs: {len(self.mcx_df)}")
             return True
         except Exception as e:
-            log.error(f"Failed to load master: {e}"); return False
+            _status(f"ERROR loading master: {e}"); return False
 
     def resolve_atm_strikes(self, spot_price):
         if not self.loaded or self.nifty_df is None: return None
@@ -319,7 +401,7 @@ class CoreEngine:
 
     def start(self):
         self.running = True; self.stop_event.clear()
-        if not self.resolver.load(): self._status("ERROR: Failed to load instrument master"); return
+        if not self.resolver.load(status_cb=self._status): self._status("ERROR: Failed to load instrument master"); return
         for k, ch in self.channels.items():
             if ch.inst_def["resolver"] == "mcx_futures":
                 info = self.resolver.resolve_mcx_near_month(ch.inst_def["mcx_symbol"])
@@ -497,11 +579,29 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark"); ctk.set_default_color_theme("blue")
         self.title(APP_TITLE); self.geometry("1400x900"); self.minsize(1100,750)
         self.engine = None; self._canvases = {}; self._build_ui()
+        # Auto-load token: shared file → localhost → .env fallback
+        self._auto_load_token()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _auto_load_token(self):
+        """Try to auto-populate credentials from Dhan Token Generator."""
+        token_data = load_token_from_shared()
+        if token_data:
+            self.entry_client_id.delete(0, "end")
+            self.entry_client_id.insert(0, token_data["client_id"])
+            self.entry_token.delete(0, "end")
+            self.entry_token.insert(0, token_data["access_token"])
+            self._append_status(f"Token auto-loaded | Client={token_data['client_id']}")
+            return
+        # Fallback to .env
         load_dotenv()
         ec = os.getenv("DHAN_CLIENT_ID",""); et = os.getenv("DHAN_ACCESS_TOKEN","")
         if ec: self.entry_client_id.insert(0, ec)
         if et: self.entry_token.insert(0, et)
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if ec and et:
+            self._append_status("Token loaded from .env")
+        else:
+            self._append_status("No token found — enter credentials or run Dhan Token Generator")
 
     def _build_ui(self):
         r1 = ctk.CTkFrame(self, height=40); r1.pack(fill="x", padx=8, pady=(8,2))
@@ -509,6 +609,8 @@ class App(ctk.CTk):
         self.entry_client_id = ctk.CTkEntry(r1, width=120, placeholder_text="Dhan Client ID"); self.entry_client_id.pack(side="left", padx=2)
         ctk.CTkLabel(r1, text="Token:").pack(side="left", padx=(8,2))
         self.entry_token = ctk.CTkEntry(r1, width=200, placeholder_text="Access Token", show="*"); self.entry_token.pack(side="left", padx=2)
+        self.btn_load_token = ctk.CTkButton(r1, text="Load Token", width=90, fg_color="#1565C0", hover_color="#1976D2", command=self._on_load_token)
+        self.btn_load_token.pack(side="left", padx=(6,2))
         self.paper_var = ctk.BooleanVar(value=True)
         self.switch_paper = ctk.CTkSwitch(r1, text="Paper", variable=self.paper_var); self.switch_paper.pack(side="left", padx=(12,4))
         self.btn_start = ctk.CTkButton(r1, text="START", width=100, fg_color="#00C853", hover_color="#00E676", text_color="#000", command=self._on_start)
@@ -565,6 +667,20 @@ class App(ctk.CTk):
         ctk.CTkLabel(sf, text="Status Log", font=("Consolas",11,"bold")).pack(anchor="w", padx=5, pady=2)
         self.status_log = ctk.CTkTextbox(sf, height=130, font=("Consolas",10), state="disabled"); self.status_log.pack(fill="both", expand=True, padx=2, pady=2)
         self._refresh_timer()
+
+    def _on_load_token(self):
+        """Manual reload token from Dhan Token Generator."""
+        token_data = load_token_from_shared()
+        if token_data:
+            self.entry_client_id.configure(state="normal")
+            self.entry_token.configure(state="normal")
+            self.entry_client_id.delete(0, "end")
+            self.entry_client_id.insert(0, token_data["client_id"])
+            self.entry_token.delete(0, "end")
+            self.entry_token.insert(0, token_data["access_token"])
+            self._append_status(f"Token reloaded | Client={token_data['client_id']}")
+        else:
+            self._append_status("No token found — run Dhan Token Generator EXE first")
 
     def _on_start(self):
         cid = self.entry_client_id.get().strip(); tok = self.entry_token.get().strip()
