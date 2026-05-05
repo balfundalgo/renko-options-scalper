@@ -65,7 +65,7 @@ WS_URL_TEMPLATE = (
     "wss://api-feed.dhan.co?version=2"
     "&token={token}&clientId={client_id}&authType=2"
 )
-INSTRUMENT_CSV_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+INSTRUMENT_CSV_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 DHAN_BASE_URL = "https://api.dhan.co/v2"
 
 REQ_SUB_TICKER = 15
@@ -260,16 +260,16 @@ class InstrumentResolver:
                 except Exception as e:
                     log.warning(f"Could not cache master: {e}")
 
-            usecols = ["EXCH_ID","SEGMENT","SECURITY_ID","INSTRUMENT","SYMBOL_NAME",
-                       "DISPLAY_NAME","SM_EXPIRY_DATE","SM_STRIKE_PRICE","SM_OPTION_TYPE"]
+            usecols = ["SEM_EXM_EXCH_ID","SEM_SEGMENT","SEM_SMST_SECURITY_ID","SEM_INSTRUMENT_NAME",
+                       "SM_SYMBOL_NAME","SEM_CUSTOM_SYMBOL","SEM_EXPIRY_DATE","SEM_STRIKE_PRICE","SEM_OPTION_TYPE"]
             df = pd.read_csv(StringIO(text), usecols=usecols, low_memory=False)
-            for c in ["EXCH_ID","SEGMENT","INSTRUMENT","SYMBOL_NAME","DISPLAY_NAME","SM_OPTION_TYPE"]:
+            for c in ["SEM_EXM_EXCH_ID","SEM_SEGMENT","SEM_INSTRUMENT_NAME","SM_SYMBOL_NAME","SEM_CUSTOM_SYMBOL","SEM_OPTION_TYPE"]:
                 df[c] = df[c].astype(str).str.strip()
-            df["SM_EXPIRY_DATE"] = pd.to_datetime(df["SM_EXPIRY_DATE"], errors="coerce")
-            df["SM_STRIKE_PRICE"] = pd.to_numeric(df["SM_STRIKE_PRICE"], errors="coerce")
-            df["SECURITY_ID"] = df["SECURITY_ID"].astype(str).str.strip()
-            self.nifty_df = df[(df["EXCH_ID"]=="NSE")&(df["INSTRUMENT"]=="OPTIDX")&(df["SYMBOL_NAME"]=="NIFTY")].copy()
-            self.mcx_df = df[(df["EXCH_ID"]=="MCX")&(df["INSTRUMENT"]=="FUTCOM")].copy()
+            df["SEM_EXPIRY_DATE"] = pd.to_datetime(df["SEM_EXPIRY_DATE"], errors="coerce")
+            df["SEM_STRIKE_PRICE"] = pd.to_numeric(df["SEM_STRIKE_PRICE"], errors="coerce")
+            df["SEM_SMST_SECURITY_ID"] = df["SEM_SMST_SECURITY_ID"].astype(str).str.strip()
+            self.nifty_df = df[(df["SEM_EXM_EXCH_ID"]=="NSE")&(df["SEM_INSTRUMENT_NAME"]=="OPTIDX")&(df["SM_SYMBOL_NAME"]=="NIFTY")].copy()
+            self.mcx_df = df[(df["SEM_EXM_EXCH_ID"]=="MCX")&(df["SEM_INSTRUMENT_NAME"]=="FUTCOM")].copy()
             self.loaded = True
             _status(f"Master loaded | NIFTY opts: {len(self.nifty_df)} | MCX futs: {len(self.mcx_df)}")
             return True
@@ -279,31 +279,31 @@ class InstrumentResolver:
     def resolve_atm_strikes(self, spot_price):
         if not self.loaded or self.nifty_df is None: return None
         today = pd.Timestamp.now().normalize()
-        future = self.nifty_df[self.nifty_df["SM_EXPIRY_DATE"] >= today]
+        future = self.nifty_df[self.nifty_df["SEM_EXPIRY_DATE"] >= today]
         if future.empty: return None
-        expiry = future["SM_EXPIRY_DATE"].min()
+        expiry = future["SEM_EXPIRY_DATE"].min()
         atm = round(spot_price / 50) * 50
-        exp_df = self.nifty_df[self.nifty_df["SM_EXPIRY_DATE"] == expiry]
-        ce = exp_df[(exp_df["SM_STRIKE_PRICE"]==atm)&(exp_df["SM_OPTION_TYPE"]=="CALL")]
-        pe = exp_df[(exp_df["SM_STRIKE_PRICE"]==atm)&(exp_df["SM_OPTION_TYPE"]=="PUT")]
+        exp_df = self.nifty_df[self.nifty_df["SEM_EXPIRY_DATE"] == expiry]
+        ce = exp_df[(exp_df["SEM_STRIKE_PRICE"]==atm)&(exp_df["SEM_OPTION_TYPE"]=="CE")]
+        pe = exp_df[(exp_df["SEM_STRIKE_PRICE"]==atm)&(exp_df["SEM_OPTION_TYPE"]=="PE")]
         if ce.empty or pe.empty:
             log.error(f"ATM {atm} CE/PE not found for {expiry.date()}"); return None
         return {"strike": int(atm), "expiry": expiry.date().isoformat(),
-                "ce_sec_id": str(int(float(ce.iloc[0]["SECURITY_ID"]))),
-                "pe_sec_id": str(int(float(pe.iloc[0]["SECURITY_ID"]))),
-                "ce_display": str(ce.iloc[0]["DISPLAY_NAME"]),
-                "pe_display": str(pe.iloc[0]["DISPLAY_NAME"])}
+                "ce_sec_id": str(int(float(ce.iloc[0]["SEM_SMST_SECURITY_ID"]))),
+                "pe_sec_id": str(int(float(pe.iloc[0]["SEM_SMST_SECURITY_ID"]))),
+                "ce_display": str(ce.iloc[0]["SEM_CUSTOM_SYMBOL"]),
+                "pe_display": str(pe.iloc[0]["SEM_CUSTOM_SYMBOL"])}
 
     def resolve_mcx_near_month(self, symbol_name):
         if not self.loaded or self.mcx_df is None: return None
         today = pd.Timestamp.now().normalize()
-        filt = self.mcx_df[(self.mcx_df["SYMBOL_NAME"]==symbol_name)&(self.mcx_df["SM_EXPIRY_DATE"]>=today)]
+        filt = self.mcx_df[(self.mcx_df["SM_SYMBOL_NAME"]==symbol_name)&(self.mcx_df["SEM_EXPIRY_DATE"]>=today)]
         if filt.empty:
             log.error(f"No MCX contract for {symbol_name}"); return None
-        row = filt.loc[filt["SM_EXPIRY_DATE"].idxmin()]
-        sec_id = str(int(float(row["SECURITY_ID"])))
-        exp = row["SM_EXPIRY_DATE"]
-        return {"sec_id": sec_id, "display": str(row["DISPLAY_NAME"]),
+        row = filt.loc[filt["SEM_EXPIRY_DATE"].idxmin()]
+        sec_id = str(int(float(row["SEM_SMST_SECURITY_ID"])))
+        exp = row["SEM_EXPIRY_DATE"]
+        return {"sec_id": sec_id, "display": str(row["SEM_CUSTOM_SYMBOL"]),
                 "expiry": exp.date().isoformat() if pd.notna(exp) else "?"}
 
 # ═══════════════════════════════════════════════════════════════════
